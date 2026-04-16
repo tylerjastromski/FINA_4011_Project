@@ -1,4 +1,3 @@
-
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -20,13 +19,36 @@ def pct(x, decimals=2):
         return "N/A"
     return f"{x * 100:.{decimals}f}%"
 
+def safe_float(x, default):
+    """Parse yfinance / form values that may be missing, NaN, or oddly typed."""
+    if x is None:
+        return default
+    try:
+        if pd.isna(x):
+            return default
+    except TypeError:
+        pass
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
 @st.cache_data(show_spinner=False)
 def load_ticker_data(ticker):
     tk = yf.Ticker(ticker)
-    info = tk.info if tk.info else {}
+    info = tk.info or {}
     hist = tk.history(period="6mo")
     financials = tk.financials
+    if financials is None or getattr(financials, "empty", True):
+        financials = getattr(tk, "income_stmt", None)
+    if financials is None:
+        financials = pd.DataFrame()
+
     cashflow = tk.cashflow
+    if cashflow is None or getattr(cashflow, "empty", True):
+        cashflow = getattr(tk, "quarterly_cashflow", None)
+    if cashflow is None:
+        cashflow = pd.DataFrame()
 
     current_price = None
     if hist is not None and not hist.empty:
@@ -176,13 +198,34 @@ if ticker:
     except Exception as e:
         st.sidebar.warning(f"Could not load ticker data: {e}")
 
-default_revenue = float(ticker_data["revenue"]) if ticker_data and ticker_data["revenue"] is not None else 1000.0
-default_growth = float(ticker_data["revenue_growth_hint"]) if ticker_data and ticker_data["revenue_growth_hint"] is not None else 0.05
-default_margin = float(ticker_data["ebit"] / ticker_data["revenue"]) if ticker_data and ticker_data["ebit"] not in [None, 0] and ticker_data["revenue"] not in [None, 0] else 0.20
-default_tax = float(ticker_data["tax_rate"]) if ticker_data and ticker_data["tax_rate"] is not None else 0.25
-default_debt = float(ticker_data["debt"]) if ticker_data and ticker_data["debt"] is not None else 500.0
-default_cash = float(ticker_data["cash"]) if ticker_data and ticker_data["cash"] is not None else 100.0
-default_shares = float(ticker_data["shares"]) if ticker_data and ticker_data["shares"] is not None else 100.0
+if ticker_data:
+    default_revenue = safe_float(ticker_data.get("revenue"), 1000.0)
+    default_growth = safe_float(ticker_data.get("revenue_growth_hint"), 0.05)
+    rev = ticker_data.get("revenue")
+    eb = ticker_data.get("ebit")
+    try:
+        rev_ok = rev is not None and not pd.isna(rev) and float(rev) != 0.0
+        eb_ok = eb is not None and not pd.isna(eb)
+    except (TypeError, ValueError):
+        rev_ok = eb_ok = False
+    if rev_ok and eb_ok:
+        default_margin = float(eb) / float(rev)
+        if not np.isfinite(default_margin) or default_margin <= 0:
+            default_margin = 0.20
+    else:
+        default_margin = 0.20
+    default_tax = safe_float(ticker_data.get("tax_rate"), 0.25)
+    default_debt = safe_float(ticker_data.get("debt"), 500.0)
+    default_cash = safe_float(ticker_data.get("cash"), 100.0)
+    default_shares = safe_float(ticker_data.get("shares"), 100.0)
+else:
+    default_revenue = 1000.0
+    default_growth = 0.05
+    default_margin = 0.20
+    default_tax = 0.25
+    default_debt = 500.0
+    default_cash = 100.0
+    default_shares = 100.0
 
 revenue = st.sidebar.number_input("Current Revenue ($)", min_value=0.0, value=default_revenue)
 years = st.sidebar.slider("Projection Years", 3, 10, 5)
@@ -419,22 +462,28 @@ with tab5:
     st.header("Sensitivity Analysis")
     sens = sensitivity_table(revenue, growth_rates, margin, tax_rate, reinvest, debt, cash, shares, wacc, terminal_growth)
     st.caption("Rows are terminal growth assumptions and columns are WACC assumptions.")
-    st.dataframe(sens.style.format("${:,.2f}", na_rep="N/A"), use_container_width=True)
+    sens_display = sens.copy()
+    for col in sens_display.columns:
+        sens_display[col] = sens_display[col].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "N/A")
+    st.dataframe(sens_display, use_container_width=True)
 
     st.write("DCF outputs are highly sensitive to discount rate and terminal growth assumptions. Use the table as a valuation range, not a single perfect number.")
 
-buffer = BytesIO()
-with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-    discounted_df.to_excel(writer, sheet_name="Projection", index=False)
-    pd.DataFrame({
-        "Metric": ["Enterprise Value", "Equity Value", "Intrinsic Value Per Share", "Current Market Price"],
-        "Value": [enterprise_value, equity_value, value_per_share, market_price]
-    }).to_excel(writer, sheet_name="Summary", index=False)
-buffer.seek(0)
-
-st.download_button(
-    "Download valuation output to Excel",
-    data=buffer,
-    file_name=f"{ticker.lower()}_dcf_model.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+try:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        discounted_df.to_excel(writer, sheet_name="Projection", index=False)
+        pd.DataFrame({
+            "Metric": ["Enterprise Value", "Equity Value", "Intrinsic Value Per Share", "Current Market Price"],
+            "Value": [enterprise_value, equity_value, value_per_share, market_price]
+        }).to_excel(writer, sheet_name="Summary", index=False)
+    buffer.seek(0)
+    safe_name = (ticker or "model").lower().replace(" ", "_")
+    st.download_button(
+        "Download valuation output to Excel",
+        data=buffer.getvalue(),
+        file_name=f"{safe_name}_dcf_model.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+except ImportError:
+    st.caption("Excel download requires **openpyxl**. Install with `pip install openpyxl` and restart the app.")
