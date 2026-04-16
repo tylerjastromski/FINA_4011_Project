@@ -1,554 +1,256 @@
-import math
-from datetime import datetime
-from typing import Dict, List, Optional
 
+import streamlit as st
 import numpy as np
 import pandas as pd
-import streamlit as st
+import yfinance as yf
+from io import BytesIO
 
+st.set_page_config(page_title="DCF Valuation App", page_icon="📊", layout="wide")
 
+st.title("📊 DCF Valuation App")
+st.caption("Teaching focused DCF model with transparent assumptions, forecast detail, and intrinsic value comparison.")
 
-st.set_page_config(
-    page_title="DCF Valuation App",
-    page_icon="💰",
-    layout="wide",
-)
-
-st.title("DCF Valuation App")
-st.caption("A teaching focused discounted cash flow model built in Streamlit.")
-
-
-def format_money(value: Optional[float], decimals: int = 2) -> str:
-    if value is None or pd.isna(value):
+def money(x, decimals=2):
+    if x is None or pd.isna(x):
         return "N/A"
-    return f"${value:,.{decimals}f}"
+    return f"${x:,.{decimals}f}"
 
-
-def format_pct(value: Optional[float], decimals: int = 2) -> str:
-    if value is None or pd.isna(value):
+def pct(x, decimals=2):
+    if x is None or pd.isna(x):
         return "N/A"
-    return f"{value:.{decimals}f}%"
-
-
-def safe_div(n: Optional[float], d: Optional[float]) -> Optional[float]:
-    try:
-        if n is None or d in [None, 0] or pd.isna(n) or pd.isna(d):
-            return None
-        return n / d
-    except Exception:
-        return None
-
+    return f"{x * 100:.{decimals}f}%"
 
 @st.cache_data(show_spinner=False)
-def load_company_data(ticker: str) -> Dict:
+def load_ticker_data(ticker):
     tk = yf.Ticker(ticker)
-
     info = tk.info if tk.info else {}
+    hist = tk.history(period="6mo")
     financials = tk.financials
     cashflow = tk.cashflow
-    balance_sheet = tk.balance_sheet
-    history = tk.history(period="1y")
 
-    latest_price = None
-    if history is not None and not history.empty:
-        latest_price = float(history["Close"].dropna().iloc[-1])
+    current_price = None
+    if hist is not None and not hist.empty:
+        current_price = float(hist["Close"].dropna().iloc[-1])
 
-    shares_outstanding = info.get("sharesOutstanding")
-    market_cap = info.get("marketCap")
-    total_debt = info.get("totalDebt")
-    cash = info.get("totalCash")
-    beta = info.get("beta")
-    company_name = info.get("longName", ticker.upper())
-    currency = info.get("currency", "USD")
-    sector = info.get("sector", "N/A")
-    industry = info.get("industry", "N/A")
-
-    def find_row(df: pd.DataFrame, candidates: List[str]) -> Optional[float]:
+    def get_first_value(df, labels):
         if df is None or df.empty:
             return None
-        for candidate in candidates:
-            matches = [idx for idx in df.index if str(idx).strip().lower() == candidate.lower()]
-            if matches:
-                series = df.loc[matches[0]]
-                series = pd.to_numeric(series, errors="coerce").dropna()
-                if not series.empty:
-                    return float(series.iloc[0])
-        for candidate in candidates:
+        for label in labels:
+            exact = [idx for idx in df.index if str(idx).strip().lower() == label.lower()]
+            if exact:
+                vals = pd.to_numeric(df.loc[exact[0]], errors="coerce").dropna()
+                if not vals.empty:
+                    return float(vals.iloc[0])
+        for label in labels:
             for idx in df.index:
-                if candidate.lower() in str(idx).lower():
-                    series = df.loc[idx]
-                    series = pd.to_numeric(series, errors="coerce").dropna()
-                    if not series.empty:
-                        return float(series.iloc[0])
+                if label.lower() in str(idx).lower():
+                    vals = pd.to_numeric(df.loc[idx], errors="coerce").dropna()
+                    if not vals.empty:
+                        return float(vals.iloc[0])
         return None
 
-    revenue = find_row(financials, ["Total Revenue", "Revenue", "Operating Revenue"])
-    ebit = find_row(financials, ["EBIT", "Operating Income"])
-    tax_provision = find_row(financials, ["Tax Provision", "Income Tax Expense"])
-    pretax_income = find_row(financials, ["Pretax Income", "Pretax Income Loss"])
-    depreciation = find_row(cashflow, ["Depreciation And Amortization", "Depreciation", "Depreciation Amortization Depletion"])
-    capex = find_row(cashflow, ["Capital Expenditure", "Capital Expenditures"])
-    wc_change = find_row(cashflow, ["Change In Working Capital", "Changes In Working Capital"])
+    revenue = get_first_value(financials, ["Total Revenue", "Revenue", "Operating Revenue"])
+    ebit = get_first_value(financials, ["EBIT", "Operating Income"])
+    dep = get_first_value(cashflow, ["Depreciation And Amortization", "Depreciation", "Depreciation Amortization Depletion"])
+    capex = get_first_value(cashflow, ["Capital Expenditure", "Capital Expenditures"])
+    wc_change = get_first_value(cashflow, ["Change In Working Capital", "Changes In Working Capital"])
 
     tax_rate = None
-    if tax_provision is not None and pretax_income not in [None, 0]:
-        raw_tax = tax_provision / pretax_income
-        if not pd.isna(raw_tax):
-            tax_rate = max(0.0, min(0.40, raw_tax))
-
-    revenue_growth_hint = info.get("revenueGrowth")
-    operating_margin_hint = safe_div(ebit, revenue)
-    dep_pct_hint = safe_div(depreciation, revenue)
-    capex_pct_hint = None
-    if capex is not None and revenue not in [None, 0]:
-        capex_pct_hint = abs(capex) / revenue
-    nwc_pct_hint = None
-    if wc_change is not None and revenue not in [None, 0]:
-        nwc_pct_hint = abs(wc_change) / revenue
+    tax_provision = get_first_value(financials, ["Tax Provision", "Income Tax Expense"])
+    pretax = get_first_value(financials, ["Pretax Income", "Pretax Income Loss"])
+    if tax_provision is not None and pretax not in [None, 0]:
+        implied_tax = tax_provision / pretax
+        if not pd.isna(implied_tax):
+            tax_rate = min(max(implied_tax, 0.0), 0.40)
 
     return {
+        "name": info.get("longName", ticker.upper()),
         "ticker": ticker.upper(),
-        "company_name": company_name,
-        "sector": sector,
-        "industry": industry,
-        "currency": currency,
-        "latest_price": latest_price,
-        "shares_outstanding": shares_outstanding,
-        "market_cap": market_cap,
-        "total_debt": total_debt,
-        "cash": cash,
-        "beta": beta,
+        "sector": info.get("sector", "N/A"),
+        "industry": info.get("industry", "N/A"),
+        "price": current_price,
+        "shares": info.get("sharesOutstanding"),
+        "market_cap": info.get("marketCap"),
+        "debt": info.get("totalDebt"),
+        "cash": info.get("totalCash"),
+        "beta": info.get("beta"),
         "revenue": revenue,
         "ebit": ebit,
-        "depreciation": depreciation,
+        "dep": dep,
         "capex": capex,
         "wc_change": wc_change,
         "tax_rate": tax_rate,
-        "revenue_growth_hint": revenue_growth_hint,
-        "operating_margin_hint": operating_margin_hint,
-        "dep_pct_hint": dep_pct_hint,
-        "capex_pct_hint": capex_pct_hint,
-        "nwc_pct_hint": nwc_pct_hint,
+        "revenue_growth_hint": info.get("revenueGrowth"),
     }
 
-
-def compute_cost_of_equity(risk_free: float, equity_risk_premium: float, beta: float) -> float:
-    return risk_free + beta * equity_risk_premium
-
-
-def compute_wacc(
-    market_cap: float,
-    total_debt: float,
-    cost_of_equity: float,
-    pre_tax_cost_of_debt: float,
-    tax_rate: float,
-) -> float:
-    total_capital = max(market_cap, 0) + max(total_debt, 0)
-    if total_capital <= 0:
-        return cost_of_equity
-    weight_equity = max(market_cap, 0) / total_capital
-    weight_debt = max(total_debt, 0) / total_capital
-    after_tax_cost_of_debt = pre_tax_cost_of_debt * (1 - tax_rate)
-    return weight_equity * cost_of_equity + weight_debt * after_tax_cost_of_debt
-
-
-def build_forecast(
-    revenue_base: float,
-    growth_years_1_5: List[float],
-    operating_margin: float,
-    tax_rate: float,
-    dep_pct: float,
-    capex_pct: float,
-    nwc_pct: float,
-) -> pd.DataFrame:
+def build_projection(revenue, growth_rates, margin, tax_rate, reinvest_rate):
     rows = []
-    revenue = revenue_base
+    rev = revenue
 
-    for i, growth in enumerate(growth_years_1_5, start=1):
-        revenue = revenue * (1 + growth)
-        ebit = revenue * operating_margin
+    for year, growth in enumerate(growth_rates, start=1):
+        rev = rev * (1 + growth)
+        ebit = rev * margin
         nopat = ebit * (1 - tax_rate)
-        depreciation = revenue * dep_pct
-        capex = revenue * capex_pct
-        change_nwc = revenue * nwc_pct
-        fcff = nopat + depreciation - capex - change_nwc
+        reinvestment = nopat * reinvest_rate
+        fcf = nopat - reinvestment
 
-        rows.append(
-            {
-                "Year": i,
-                "Revenue": revenue,
-                "Growth": growth,
-                "EBIT": ebit,
-                "EBIT Margin": operating_margin,
-                "NOPAT": nopat,
-                "D&A": depreciation,
-                "Capex": capex,
-                "Change in NWC": change_nwc,
-                "FCFF": fcff,
-            }
-        )
+        rows.append({
+            "Year": year,
+            "Revenue": rev,
+            "Growth Rate": growth,
+            "EBIT": ebit,
+            "EBIT Margin": margin,
+            "NOPAT": nopat,
+            "Reinvestment": reinvestment,
+            "FCF": fcf,
+        })
 
     return pd.DataFrame(rows)
 
+def discount_valuation(df, wacc, terminal_growth, debt, cash, shares):
+    out = df.copy()
+    out["Discount Factor"] = [1 / ((1 + wacc) ** yr) for yr in out["Year"]]
+    out["PV of FCF"] = out["FCF"] * out["Discount Factor"]
 
-def discount_forecast(
-    forecast_df: pd.DataFrame,
-    wacc: float,
-    terminal_growth: float,
-    total_debt: float,
-    cash: float,
-    shares_outstanding: float,
-) -> Dict:
-    df = forecast_df.copy()
-    df["Discount Factor"] = 1 / ((1 + wacc) ** df["Year"])
-    df["PV of FCFF"] = df["FCFF"] * df["Discount Factor"]
+    terminal_fcf = float(out.iloc[-1]["FCF"])
+    terminal_value = terminal_fcf * (1 + terminal_growth) / (wacc - terminal_growth)
+    pv_terminal = terminal_value / ((1 + wacc) ** int(out.iloc[-1]["Year"]))
 
-    terminal_year_fcff = float(df.iloc[-1]["FCFF"])
-    terminal_value = terminal_year_fcff * (1 + terminal_growth) / (wacc - terminal_growth)
-    terminal_pv = terminal_value / ((1 + wacc) ** int(df.iloc[-1]["Year"]))
+    enterprise_value = out["PV of FCF"].sum() + pv_terminal
+    equity_value = enterprise_value - debt + cash
+    value_per_share = equity_value / shares if shares not in [0, None] else np.nan
 
-    enterprise_value = df["PV of FCFF"].sum() + terminal_pv
-    equity_value = enterprise_value - total_debt + cash
-    intrinsic_value_per_share = equity_value / shares_outstanding if shares_outstanding > 0 else np.nan
+    return out, terminal_value, pv_terminal, enterprise_value, equity_value, value_per_share
 
-    return {
-        "discounted_df": df,
-        "terminal_value": terminal_value,
-        "terminal_pv": terminal_pv,
-        "enterprise_value": enterprise_value,
-        "equity_value": equity_value,
-        "intrinsic_value_per_share": intrinsic_value_per_share,
-    }
+def sensitivity_table(revenue, growth_rates, margin, tax_rate, reinvest_rate, debt, cash, shares, base_wacc, base_tg):
+    waccs = [max(0.01, round(base_wacc + x, 4)) for x in [-0.02, -0.01, 0.00, 0.01, 0.02]]
+    tgs = [max(0.00, round(base_tg + x, 4)) for x in [-0.01, -0.005, 0.00, 0.005, 0.01]]
 
+    table = pd.DataFrame(index=[f"{tg*100:.1f}%" for tg in tgs])
 
-def build_sensitivity(
-    revenue_base: float,
-    growth_years_1_5: List[float],
-    operating_margin: float,
-    tax_rate: float,
-    dep_pct: float,
-    capex_pct: float,
-    nwc_pct: float,
-    wacc_values: List[float],
-    terminal_growth_values: List[float],
-    total_debt: float,
-    cash: float,
-    shares_outstanding: float,
-) -> pd.DataFrame:
-    grid = pd.DataFrame(index=[f"{g*100:.1f}%" for g in terminal_growth_values])
-
-    for wacc in wacc_values:
-        values = []
-        for tg in terminal_growth_values:
-            if wacc <= tg:
-                values.append(np.nan)
+    for w in waccs:
+        vals = []
+        for tg in tgs:
+            if w <= tg:
+                vals.append(np.nan)
                 continue
-            forecast = build_forecast(
-                revenue_base=revenue_base,
-                growth_years_1_5=growth_years_1_5,
-                operating_margin=operating_margin,
-                tax_rate=tax_rate,
-                dep_pct=dep_pct,
-                capex_pct=capex_pct,
-                nwc_pct=nwc_pct,
-            )
-            result = discount_forecast(
-                forecast_df=forecast,
-                wacc=wacc,
-                terminal_growth=tg,
-                total_debt=total_debt,
-                cash=cash,
-                shares_outstanding=shares_outstanding,
-            )
-            values.append(result["intrinsic_value_per_share"])
-        grid[f"{wacc*100:.1f}%"] = values
+            proj = build_projection(revenue, growth_rates, margin, tax_rate, reinvest_rate)
+            _, _, _, _, _, vps = discount_valuation(proj, w, tg, debt, cash, shares)
+            vals.append(vps)
+        table[f"{w*100:.1f}%"] = vals
 
-    grid.index.name = "Terminal Growth"
-    return grid
+    table.index.name = "Terminal Growth"
+    return table
 
-
-with st.expander("How this app works", expanded=True):
-    st.markdown(
+with st.expander("What this app does", expanded=True):
+    st.write(
         """
-        This app estimates intrinsic value with a free cash flow to firm DCF.
+        This app starts with your simple DCF structure and improves it by adding:
 
-        The model follows this flow:
+        • ticker based company lookup  
+        • automatic market price retrieval  
+        • editable DCF assumptions  
+        • full forecast breakdown  
+        • intrinsic value versus current price comparison  
+        • sensitivity analysis  
+        • exportable model output
 
-        1. Pull company data using the ticker.
-        2. Let you review or override key assumptions.
-        3. Forecast revenue, operating profit, taxes, reinvestment, and free cash flow.
-        4. Discount projected cash flows at WACC.
-        5. Estimate terminal value and convert enterprise value into equity value per share.
+        Core model used here:
 
-        The app is intentionally transparent. Every major input and intermediate step is shown below.
+        EBIT = Revenue × Margin  
+        NOPAT = EBIT × (1 − Tax Rate)  
+        Reinvestment = NOPAT × Reinvestment Rate  
+        FCF = NOPAT − Reinvestment  
+        Enterprise Value = PV of Forecast FCF + PV of Terminal Value
         """
     )
 
-ticker = st.text_input("Ticker", value="AAPL").strip().upper()
+st.sidebar.header("Inputs")
 
-if not ticker:
+ticker = st.sidebar.text_input("Ticker", value="AAPL").strip().upper()
+
+ticker_data = None
+if ticker:
+    try:
+        ticker_data = load_ticker_data(ticker)
+    except Exception as e:
+        st.sidebar.warning(f"Could not load ticker data: {e}")
+
+default_revenue = float(ticker_data["revenue"]) if ticker_data and ticker_data["revenue"] is not None else 1000.0
+default_growth = float(ticker_data["revenue_growth_hint"]) if ticker_data and ticker_data["revenue_growth_hint"] is not None else 0.05
+default_margin = float(ticker_data["ebit"] / ticker_data["revenue"]) if ticker_data and ticker_data["ebit"] not in [None, 0] and ticker_data["revenue"] not in [None, 0] else 0.20
+default_tax = float(ticker_data["tax_rate"]) if ticker_data and ticker_data["tax_rate"] is not None else 0.25
+default_debt = float(ticker_data["debt"]) if ticker_data and ticker_data["debt"] is not None else 500.0
+default_cash = float(ticker_data["cash"]) if ticker_data and ticker_data["cash"] is not None else 100.0
+default_shares = float(ticker_data["shares"]) if ticker_data and ticker_data["shares"] is not None else 100.0
+
+revenue = st.sidebar.number_input("Current Revenue ($)", min_value=0.0, value=default_revenue)
+years = st.sidebar.slider("Projection Years", 3, 10, 5)
+
+st.sidebar.subheader("Growth Assumptions")
+growth_rates = []
+for i in range(years):
+    default_i = max(default_growth - 0.01 * i, -0.50)
+    g = st.sidebar.number_input(f"Year {i+1} Growth Rate (%)", value=float(default_i * 100), step=0.5) / 100
+    growth_rates.append(g)
+
+margin = st.sidebar.number_input("EBIT Margin (%)", value=float(default_margin * 100), step=0.5) / 100
+tax_rate = st.sidebar.number_input("Tax Rate (%)", value=float(default_tax * 100), step=0.5) / 100
+reinvest = st.sidebar.number_input("Reinvestment Rate (%)", value=50.0, step=0.5) / 100
+
+st.sidebar.subheader("Valuation Assumptions")
+wacc = st.sidebar.number_input("WACC (%)", value=10.0, step=0.25) / 100
+terminal_growth = st.sidebar.number_input("Terminal Growth (%)", value=2.5, step=0.25) / 100
+
+st.sidebar.subheader("Capital Structure")
+debt = st.sidebar.number_input("Debt ($)", min_value=0.0, value=default_debt)
+cash = st.sidebar.number_input("Cash ($)", min_value=0.0, value=default_cash)
+shares = st.sidebar.number_input("Shares Outstanding", min_value=0.000001, value=default_shares)
+
+if wacc <= terminal_growth:
+    st.error("WACC must be greater than terminal growth for the terminal value formula to work.")
     st.stop()
 
-try:
-    data = load_company_data(ticker)
-except Exception as exc:
-    st.error(f"Could not load data for {ticker}. Error: {exc}")
-    st.stop()
+if ticker_data:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Company", ticker_data["name"])
+    c2.metric("Current Price", money(ticker_data["price"]))
+    c3.metric("Sector", ticker_data["sector"])
+    c4.metric("Industry", ticker_data["industry"])
 
-left, right = st.columns([1.2, 1])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Valuation Summary",
+    "Assumptions",
+    "Projection",
+    "DCF Walkthrough",
+    "Sensitivity",
+])
 
-with left:
-    st.subheader(f"{data['company_name']} ({data['ticker']})")
-    st.write(f"Sector: {data['sector']}")
-    st.write(f"Industry: {data['industry']}")
-    st.write(f"Currency: {data['currency']}")
-
-with right:
-    st.metric("Current Market Price", format_money(data["latest_price"]))
-    st.metric("Shares Outstanding", f"{data['shares_outstanding']:,.0f}" if data["shares_outstanding"] else "N/A")
-    st.metric("Market Cap", format_money(data["market_cap"], 0))
-
-st.divider()
-
-st.subheader("Step 1: Review base company data")
-
-base_df = pd.DataFrame(
-    {
-        "Metric": [
-            "Latest Revenue",
-            "Latest EBIT",
-            "Tax Rate Estimate",
-            "Depreciation and Amortization",
-            "Capital Expenditures",
-            "Change in Working Capital",
-            "Cash",
-            "Debt",
-            "Beta",
-        ],
-        "Value": [
-            format_money(data["revenue"], 0),
-            format_money(data["ebit"], 0),
-            format_pct(data["tax_rate"] * 100 if data["tax_rate"] is not None else None),
-            format_money(data["depreciation"], 0),
-            format_money(data["capex"], 0),
-            format_money(data["wc_change"], 0),
-            format_money(data["cash"], 0),
-            format_money(data["total_debt"], 0),
-            f"{data['beta']:.2f}" if data["beta"] is not None else "N/A",
-        ],
-        "Why it matters": [
-            "Starting point for forecasting future sales",
-            "Used to estimate operating profitability",
-            "Converts EBIT into after tax operating profit",
-            "Non cash add back in FCFF",
-            "Investment needed to maintain and grow the business",
-            "Cash tied up in operations",
-            "Added back when converting enterprise value to equity value",
-            "Subtracted when converting enterprise value to equity value",
-            "Used in CAPM to estimate cost of equity",
-        ],
-    }
-)
-st.dataframe(base_df, use_container_width=True, hide_index=True)
-
-st.subheader("Step 2: Set valuation assumptions")
-
-col1, col2, col3 = st.columns(3)
-
-default_rev_growth = data["revenue_growth_hint"] if data["revenue_growth_hint"] is not None else 0.08
-default_margin = data["operating_margin_hint"] if data["operating_margin_hint"] is not None else 0.20
-default_tax = data["tax_rate"] if data["tax_rate"] is not None else 0.21
-default_dep_pct = data["dep_pct_hint"] if data["dep_pct_hint"] is not None else 0.03
-default_capex_pct = data["capex_pct_hint"] if data["capex_pct_hint"] is not None else 0.04
-default_nwc_pct = data["nwc_pct_hint"] if data["nwc_pct_hint"] is not None else 0.01
-default_beta = data["beta"] if data["beta"] is not None else 1.0
-
-with col1:
-    st.markdown("**Operating assumptions**")
-    growth_y1 = st.number_input("Revenue Growth Year 1", min_value=-0.50, max_value=1.00, value=float(default_rev_growth), step=0.01, format="%.2f",
-                                help="Expected revenue growth in the first forecast year.")
-    growth_y2 = st.number_input("Revenue Growth Year 2", min_value=-0.50, max_value=1.00, value=float(max(default_rev_growth - 0.01, -0.50)), step=0.01, format="%.2f")
-    growth_y3 = st.number_input("Revenue Growth Year 3", min_value=-0.50, max_value=1.00, value=float(max(default_rev_growth - 0.02, -0.50)), step=0.01, format="%.2f")
-    growth_y4 = st.number_input("Revenue Growth Year 4", min_value=-0.50, max_value=1.00, value=float(max(default_rev_growth - 0.03, -0.50)), step=0.01, format="%.2f")
-    growth_y5 = st.number_input("Revenue Growth Year 5", min_value=-0.50, max_value=1.00, value=float(max(default_rev_growth - 0.04, -0.50)), step=0.01, format="%.2f")
-    operating_margin = st.number_input("Operating Margin", min_value=-0.20, max_value=0.80, value=float(default_margin), step=0.01, format="%.2f",
-                                       help="EBIT as a percent of revenue.")
-    tax_rate = st.number_input("Tax Rate", min_value=0.00, max_value=0.50, value=float(default_tax), step=0.01, format="%.2f",
-                               help="Tax applied to EBIT to estimate NOPAT.")
-
-with col2:
-    st.markdown("**Reinvestment assumptions**")
-    dep_pct = st.number_input("D&A as Percent of Revenue", min_value=0.00, max_value=0.30, value=float(default_dep_pct), step=0.005, format="%.3f",
-                              help="Non cash expense added back in FCFF.")
-    capex_pct = st.number_input("Capex as Percent of Revenue", min_value=0.00, max_value=0.40, value=float(default_capex_pct), step=0.005, format="%.3f",
-                                help="Capital investment deducted in FCFF.")
-    nwc_pct = st.number_input("Change in NWC as Percent of Revenue", min_value=-0.10, max_value=0.20, value=float(default_nwc_pct), step=0.005, format="%.3f",
-                              help="Incremental working capital needs deducted in FCFF.")
-    terminal_growth = st.number_input("Terminal Growth Rate", min_value=0.00, max_value=0.08, value=0.025, step=0.005, format="%.3f",
-                                      help="Long run perpetual growth rate after Year 5.")
-
-with col3:
-    st.markdown("**Discount rate assumptions**")
-    use_manual_wacc = st.checkbox("Use manual WACC", value=False)
-    risk_free_rate = st.number_input("Risk Free Rate", min_value=0.00, max_value=0.15, value=0.043, step=0.001, format="%.3f",
-                                     help="Usually based on a long term government bond yield.")
-    equity_risk_premium = st.number_input("Equity Risk Premium", min_value=0.00, max_value=0.15, value=0.055, step=0.001, format="%.3f",
-                                          help="Extra return investors require for equities over the risk free rate.")
-    beta = st.number_input("Beta", min_value=0.10, max_value=3.00, value=float(default_beta), step=0.05, format="%.2f")
-    pre_tax_cost_of_debt = st.number_input("Pre Tax Cost of Debt", min_value=0.00, max_value=0.20, value=0.050, step=0.001, format="%.3f")
-    manual_wacc = st.number_input("Manual WACC", min_value=0.01, max_value=0.30, value=0.090, step=0.001, format="%.3f",
-                                  help="Used only if the box above is checked.")
-
-base_revenue = st.number_input(
-    "Starting Revenue",
-    min_value=0.0,
-    value=float(data["revenue"]) if data["revenue"] is not None else 1000000000.0,
-    step=1000000.0,
-    help="Most recent revenue used as the base year for projections.",
+projection_df = build_projection(revenue, growth_rates, margin, tax_rate, reinvest)
+discounted_df, terminal_value, pv_terminal, enterprise_value, equity_value, value_per_share = discount_valuation(
+    projection_df, wacc, terminal_growth, debt, cash, shares
 )
 
-cash = float(data["cash"]) if data["cash"] is not None else 0.0
-debt = float(data["total_debt"]) if data["total_debt"] is not None else 0.0
-market_cap = float(data["market_cap"]) if data["market_cap"] is not None else (
-    float(data["latest_price"]) * float(data["shares_outstanding"])
-    if data["latest_price"] is not None and data["shares_outstanding"] is not None
-    else 0.0
-)
-shares_outstanding = float(data["shares_outstanding"]) if data["shares_outstanding"] is not None else 1.0
+market_price = ticker_data["price"] if ticker_data else None
+valuation_gap = None
+if market_price not in [None, 0] and not pd.isna(value_per_share):
+    valuation_gap = value_per_share / market_price - 1
 
-cost_of_equity = compute_cost_of_equity(risk_free_rate, equity_risk_premium, beta)
-auto_wacc = compute_wacc(
-    market_cap=market_cap,
-    total_debt=debt,
-    cost_of_equity=cost_of_equity,
-    pre_tax_cost_of_debt=pre_tax_cost_of_debt,
-    tax_rate=tax_rate,
-)
-selected_wacc = manual_wacc if use_manual_wacc else auto_wacc
+with tab1:
+    st.header("Valuation Summary")
 
-if selected_wacc <= terminal_growth:
-    st.error("WACC must be greater than terminal growth rate for the terminal value formula to work.")
-    st.stop()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Enterprise Value", money(enterprise_value))
+    m2.metric("Equity Value", money(equity_value))
+    m3.metric("Intrinsic Value Per Share", money(value_per_share))
+    m4.metric("Current Market Price", money(market_price))
 
-growth_list = [growth_y1, growth_y2, growth_y3, growth_y4, growth_y5]
+    if valuation_gap is not None:
+        st.metric("Upside / Downside", f"{valuation_gap*100:,.2f}%")
 
-assumption_df = pd.DataFrame(
-    {
-        "Input": [
-            "Revenue Growth Year 1",
-            "Revenue Growth Year 2",
-            "Revenue Growth Year 3",
-            "Revenue Growth Year 4",
-            "Revenue Growth Year 5",
-            "Operating Margin",
-            "Tax Rate",
-            "D&A as Percent of Revenue",
-            "Capex as Percent of Revenue",
-            "Change in NWC as Percent of Revenue",
-            "Risk Free Rate",
-            "Equity Risk Premium",
-            "Beta",
-            "Pre Tax Cost of Debt",
-            "Selected WACC",
-            "Terminal Growth",
-        ],
-        "Value": [
-            format_pct(growth_y1 * 100),
-            format_pct(growth_y2 * 100),
-            format_pct(growth_y3 * 100),
-            format_pct(growth_y4 * 100),
-            format_pct(growth_y5 * 100),
-            format_pct(operating_margin * 100),
-            format_pct(tax_rate * 100),
-            format_pct(dep_pct * 100),
-            format_pct(capex_pct * 100),
-            format_pct(nwc_pct * 100),
-            format_pct(risk_free_rate * 100),
-            format_pct(equity_risk_premium * 100),
-            f"{beta:.2f}",
-            format_pct(pre_tax_cost_of_debt * 100),
-            format_pct(selected_wacc * 100),
-            format_pct(terminal_growth * 100),
-        ],
-        "Explanation": [
-            "Top line growth for forecast year 1",
-            "Top line growth for forecast year 2",
-            "Top line growth for forecast year 3",
-            "Top line growth for forecast year 4",
-            "Top line growth for forecast year 5",
-            "Converts revenue into EBIT",
-            "Converts EBIT into NOPAT",
-            "Non cash add back assumption",
-            "Capital investment assumption",
-            "Working capital investment assumption",
-            "Base return for CAPM",
-            "Market premium for CAPM",
-            "Measures stock sensitivity to the market",
-            "Debt financing cost",
-            "Discount rate applied to FCFF",
-            "Long run growth after explicit forecast period",
-        ],
-    }
-)
-st.dataframe(assumption_df, use_container_width=True, hide_index=True)
-
-st.subheader("Step 3: Forecast the business")
-
-forecast_df = build_forecast(
-    revenue_base=base_revenue,
-    growth_years_1_5=growth_list,
-    operating_margin=operating_margin,
-    tax_rate=tax_rate,
-    dep_pct=dep_pct,
-    capex_pct=capex_pct,
-    nwc_pct=nwc_pct,
-)
-
-display_forecast = forecast_df.copy()
-for col in ["Revenue", "EBIT", "NOPAT", "D&A", "Capex", "Change in NWC", "FCFF"]:
-    display_forecast[col] = display_forecast[col].map(lambda x: format_money(x, 0))
-display_forecast["Growth"] = forecast_df["Growth"].map(lambda x: format_pct(x * 100))
-display_forecast["EBIT Margin"] = forecast_df["EBIT Margin"].map(lambda x: format_pct(x * 100))
-st.dataframe(display_forecast, use_container_width=True, hide_index=True)
-
-with st.expander("Show FCFF formula explanation", expanded=False):
-    st.markdown(
-        """
-        Free Cash Flow to Firm is calculated as:
-
-        **FCFF = NOPAT + D&A - Capex - Change in NWC**
-
-        Where:
-
-        * **NOPAT** = EBIT × (1 - Tax Rate)
-        * **D&A** is added back because it is a non cash expense
-        * **Capex** is subtracted because it represents investment in long lived assets
-        * **Change in NWC** is subtracted because growing operations usually require more working capital
-        """
-    )
-
-st.subheader("Step 4: Discount projected cash flows and estimate value")
-
-valuation_result = discount_forecast(
-    forecast_df=forecast_df,
-    wacc=selected_wacc,
-    terminal_growth=terminal_growth,
-    total_debt=debt,
-    cash=cash,
-    shares_outstanding=shares_outstanding,
-)
-
-discount_df = valuation_result["discounted_df"].copy()
-display_discount = discount_df.copy()
-for col in ["FCFF", "PV of FCFF"]:
-    display_discount[col] = display_discount[col].map(lambda x: format_money(x, 0))
-display_discount["Discount Factor"] = discount_df["Discount Factor"].map(lambda x: f"{x:.4f}")
-st.dataframe(display_discount[["Year", "FCFF", "Discount Factor", "PV of FCFF"]], use_container_width=True, hide_index=True)
-
-bridge_df = pd.DataFrame(
-    {
-        "Valuation Bridge": [
-            "Present Value of Forecast Period FCFF",
+    bridge = pd.DataFrame({
+        "Line Item": [
+            "Present Value of Forecast FCF",
             "Present Value of Terminal Value",
             "Enterprise Value",
             "Less Debt",
@@ -556,151 +258,183 @@ bridge_df = pd.DataFrame(
             "Equity Value",
             "Intrinsic Value Per Share",
             "Current Market Price",
-            "Upside / Downside",
         ],
         "Amount": [
-            format_money(discount_df["PV of FCFF"].sum(), 0),
-            format_money(valuation_result["terminal_pv"], 0),
-            format_money(valuation_result["enterprise_value"], 0),
-            format_money(-debt, 0),
-            format_money(cash, 0),
-            format_money(valuation_result["equity_value"], 0),
-            format_money(valuation_result["intrinsic_value_per_share"]),
-            format_money(data["latest_price"]),
-            format_pct(
-                (
-                    (valuation_result["intrinsic_value_per_share"] / data["latest_price"] - 1) * 100
-                    if data["latest_price"] not in [None, 0]
-                    else None
-                )
-            ),
-        ],
-    }
-)
-st.dataframe(bridge_df, use_container_width=True, hide_index=True)
+            discounted_df["PV of FCF"].sum(),
+            pv_terminal,
+            enterprise_value,
+            -debt,
+            cash,
+            equity_value,
+            value_per_share,
+            market_price if market_price is not None else np.nan,
+        ]
+    })
 
-metric1, metric2, metric3 = st.columns(3)
-metric1.metric("Intrinsic Value Per Share", format_money(valuation_result["intrinsic_value_per_share"]))
-metric2.metric("Current Price", format_money(data["latest_price"]))
-if data["latest_price"] not in [None, 0]:
-    pct_gap = (valuation_result["intrinsic_value_per_share"] / data["latest_price"] - 1) * 100
-    metric3.metric("Valuation Gap", format_pct(pct_gap))
-else:
-    metric3.metric("Valuation Gap", "N/A")
+    bridge_display = bridge.copy()
+    bridge_display["Amount"] = bridge_display["Amount"].apply(lambda x: money(x))
+    st.subheader("Valuation Bridge")
+    st.dataframe(bridge_display, use_container_width=True, hide_index=True)
 
-st.subheader("Step 5: Understand the discount rate")
+with tab2:
+    st.header("Assumptions")
 
-capital_structure_df = pd.DataFrame(
-    {
-        "Component": [
-            "Risk Free Rate",
-            "Equity Risk Premium",
-            "Beta",
-            "Cost of Equity",
-            "Pre Tax Cost of Debt",
+    assumptions = pd.DataFrame({
+        "Input": [
+            "Ticker",
+            "Current Revenue",
+            "Projection Years",
+            "Year 1 Growth",
+            "Year 2 Growth",
+            "Year 3 Growth",
+            "Year 4 Growth" if years >= 4 else None,
+            "Year 5 Growth" if years >= 5 else None,
+            "EBIT Margin",
             "Tax Rate",
-            "After Tax Cost of Debt",
-            "Market Cap",
+            "Reinvestment Rate",
+            "WACC",
+            "Terminal Growth",
             "Debt",
-            "Auto WACC",
-            "Selected WACC",
+            "Cash",
+            "Shares Outstanding",
         ],
         "Value": [
-            format_pct(risk_free_rate * 100),
-            format_pct(equity_risk_premium * 100),
-            f"{beta:.2f}",
-            format_pct(cost_of_equity * 100),
-            format_pct(pre_tax_cost_of_debt * 100),
-            format_pct(tax_rate * 100),
-            format_pct(pre_tax_cost_of_debt * (1 - tax_rate) * 100),
-            format_money(market_cap, 0),
-            format_money(debt, 0),
-            format_pct(auto_wacc * 100),
-            format_pct(selected_wacc * 100),
+            ticker,
+            revenue,
+            years,
+            growth_rates[0] if years >= 1 else None,
+            growth_rates[1] if years >= 2 else None,
+            growth_rates[2] if years >= 3 else None,
+            growth_rates[3] if years >= 4 else None,
+            growth_rates[4] if years >= 5 else None,
+            margin,
+            tax_rate,
+            reinvest,
+            wacc,
+            terminal_growth,
+            debt,
+            cash,
+            shares,
         ],
-        "Explanation": [
-            "Government bond yield used as the base rate",
-            "Extra expected return for equities",
-            "Sensitivity to market movements",
-            "CAPM result: risk free rate plus beta times ERP",
-            "Borrowing cost before tax benefit",
-            "Used for debt tax shield",
-            "Debt cost after accounting for taxes",
-            "Equity portion of capital structure",
-            "Debt portion of capital structure",
-            "Weighted blend of equity and debt financing costs",
-            "Final discount rate actually used in valuation",
+        "Why It Matters": [
+            "Identifies the company and allows automatic market data retrieval.",
+            "Sets the starting point for the forecast.",
+            "Controls the explicit forecast horizon.",
+            "Drives top line growth in year 1.",
+            "Drives top line growth in year 2.",
+            "Drives top line growth in year 3.",
+            "Drives top line growth in year 4." if years >= 4 else None,
+            "Drives top line growth in year 5." if years >= 5 else None,
+            "Converts revenue into operating profit.",
+            "Converts EBIT into after tax operating profit.",
+            "Represents how much NOPAT must be reinvested to sustain growth.",
+            "Discount rate used to value future cash flows.",
+            "Long run perpetual growth assumption used in terminal value.",
+            "Subtracted from enterprise value to get equity value.",
+            "Added back to enterprise value to get equity value.",
+            "Used to calculate value per share.",
         ],
-    }
-)
-st.dataframe(capital_structure_df, use_container_width=True, hide_index=True)
+    }).dropna()
 
-st.subheader("Sensitivity analysis")
-
-wacc_range = [selected_wacc - 0.02, selected_wacc - 0.01, selected_wacc, selected_wacc + 0.01, selected_wacc + 0.02]
-tg_range = [terminal_growth - 0.01, terminal_growth - 0.005, terminal_growth, terminal_growth + 0.005, terminal_growth + 0.01]
-wacc_range = [max(0.01, x) for x in wacc_range]
-tg_range = [max(0.0, x) for x in tg_range]
-
-sensitivity_df = build_sensitivity(
-    revenue_base=base_revenue,
-    growth_years_1_5=growth_list,
-    operating_margin=operating_margin,
-    tax_rate=tax_rate,
-    dep_pct=dep_pct,
-    capex_pct=capex_pct,
-    nwc_pct=nwc_pct,
-    wacc_values=wacc_range,
-    terminal_growth_values=tg_range,
-    total_debt=debt,
-    cash=cash,
-    shares_outstanding=shares_outstanding,
-)
-
-st.caption("Rows are terminal growth assumptions. Columns are WACC assumptions. Values are intrinsic value per share.")
-st.dataframe(
-    sensitivity_df.style.format("${:,.2f}", na_rep="N/A"),
-    use_container_width=True,
-)
-
-with st.expander("Interpretation guide", expanded=False):
-    st.markdown(
-        """
-        A DCF is extremely sensitive to a few assumptions:
-
-        * Revenue growth
-        * Operating margin
-        * WACC
-        * Terminal growth
-
-        Treat the result as a valuation range, not a single perfect number.
-        """
+    display_assumptions = assumptions.copy()
+    display_assumptions["Value"] = display_assumptions.apply(
+        lambda row: money(row["Value"]) if row["Input"] in ["Current Revenue", "Debt", "Cash"] else (
+            f"{row['Value']:,.0f}" if row["Input"] in ["Projection Years", "Shares Outstanding"] else (
+                pct(row["Value"]) if row["Input"] not in ["Ticker"] else row["Value"]
+            )
+        ),
+        axis=1
     )
+    st.dataframe(display_assumptions, use_container_width=True, hide_index=True)
 
-st.subheader("Download model output")
+with tab3:
+    st.header("Projection")
+    display_proj = discounted_df.copy()
+    for col in ["Revenue", "EBIT", "NOPAT", "Reinvestment", "FCF", "PV of FCF"]:
+        display_proj[col] = display_proj[col].map(lambda x: money(x))
+    for col in ["Growth Rate", "EBIT Margin"]:
+        display_proj[col] = discounted_df[col].map(lambda x: pct(x))
+    display_proj["Discount Factor"] = discounted_df["Discount Factor"].map(lambda x: f"{x:,.4f}")
 
-download_forecast = forecast_df.copy()
-download_discount = discount_df.copy()
-download_assumptions = assumption_df.copy()
-download_bridge = bridge_df.copy()
-download_sensitivity = sensitivity_df.copy()
+    st.dataframe(display_proj, use_container_width=True, hide_index=True)
 
-from io import BytesIO
+    st.subheader("Charts")
+    st.line_chart(projection_df.set_index("Year")[["Revenue", "FCF"]])
+    st.bar_chart(projection_df.set_index("Year")[["EBIT", "NOPAT", "Reinvestment"]])
+
+with tab4:
+    st.header("DCF Walkthrough")
+
+    st.markdown("""
+    **Step 1**  
+    Forecast revenue using your annual growth assumptions.
+
+    **Step 2**  
+    Estimate EBIT using EBIT Margin.
+
+    **Step 3**  
+    Convert EBIT to NOPAT using the tax rate.
+
+    **Step 4**  
+    Estimate reinvestment as a percent of NOPAT.
+
+    **Step 5**  
+    Compute free cash flow:
+
+    `FCF = NOPAT − Reinvestment`
+
+    **Step 6**  
+    Discount each future FCF using WACC.
+
+    **Step 7**  
+    Estimate terminal value:
+
+    `Terminal Value = Final Year FCF × (1 + g) / (WACC − g)`
+
+    **Step 8**  
+    Convert enterprise value to equity value:
+
+    `Equity Value = Enterprise Value − Debt + Cash`
+
+    **Step 9**  
+    Divide by shares outstanding to get intrinsic value per share.
+    """)
+
+    walkthrough = pd.DataFrame({
+        "Year": discounted_df["Year"],
+        "FCF": discounted_df["FCF"],
+        "Discount Factor": discounted_df["Discount Factor"],
+        "PV of FCF": discounted_df["PV of FCF"],
+    })
+    walkthrough_display = walkthrough.copy()
+    walkthrough_display["FCF"] = walkthrough_display["FCF"].map(lambda x: money(x))
+    walkthrough_display["Discount Factor"] = walkthrough_display["Discount Factor"].map(lambda x: f"{x:,.4f}")
+    walkthrough_display["PV of FCF"] = walkthrough_display["PV of FCF"].map(lambda x: money(x))
+    st.dataframe(walkthrough_display, use_container_width=True, hide_index=True)
+
+    st.write(f"Terminal Value: {money(terminal_value)}")
+    st.write(f"Present Value of Terminal Value: {money(pv_terminal)}")
+
+with tab5:
+    st.header("Sensitivity Analysis")
+    sens = sensitivity_table(revenue, growth_rates, margin, tax_rate, reinvest, debt, cash, shares, wacc, terminal_growth)
+    st.caption("Rows are terminal growth assumptions and columns are WACC assumptions.")
+    st.dataframe(sens.style.format("${:,.2f}", na_rep="N/A"), use_container_width=True)
+
+    st.write("DCF outputs are highly sensitive to discount rate and terminal growth assumptions. Use the table as a valuation range, not a single perfect number.")
 
 buffer = BytesIO()
 with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-    download_assumptions.to_excel(writer, sheet_name="Assumptions", index=False)
-    download_forecast.to_excel(writer, sheet_name="Forecast", index=False)
-    download_discount.to_excel(writer, sheet_name="Discounted_Cash_Flows", index=False)
-    download_bridge.to_excel(writer, sheet_name="Valuation_Bridge", index=False)
-    download_sensitivity.to_excel(writer, sheet_name="Sensitivity")
+    discounted_df.to_excel(writer, sheet_name="Projection", index=False)
+    pd.DataFrame({
+        "Metric": ["Enterprise Value", "Equity Value", "Intrinsic Value Per Share", "Current Market Price"],
+        "Value": [enterprise_value, equity_value, value_per_share, market_price]
+    }).to_excel(writer, sheet_name="Summary", index=False)
 buffer.seek(0)
 
 st.download_button(
-    "Download DCF workbook as Excel",
+    "Download valuation output to Excel",
     data=buffer,
-    file_name=f"{ticker}_dcf_output.xlsx",
+    file_name=f"{ticker.lower()}_dcf_model.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
-
-st.caption(f"Last refreshed: {datetime.now().strftime('%Y %m %d %H:%M:%S')}")
