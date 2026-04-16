@@ -39,7 +39,13 @@ def safe_float(x, default):
     except (TypeError, ValueError):
         return default
 
-@st.cache_data(show_spinner=False)
+def _is_rate_limit_error(err: BaseException) -> bool:
+    msg = str(err).lower()
+    return "too many requests" in msg or "rate limit" in msg or "429" in msg
+
+# yfinance hits Yahoo many times per ticker (info, history, statements). Cache aggressively
+# and avoid refetching on every widget interaction (see sidebar load flow).
+@st.cache_data(show_spinner=False, ttl=3600)
 def load_ticker_data(ticker):
     tk = yf.Ticker(ticker)
     info = tk.info or {}
@@ -195,14 +201,52 @@ with st.expander("What this app does", expanded=True):
 
 st.sidebar.header("Inputs")
 
-ticker = st.sidebar.text_input("Ticker", value="AAPL").strip().upper()
+if "dcf_loaded_ticker" not in st.session_state:
+    st.session_state.dcf_loaded_ticker = None
+if "dcf_ticker_data" not in st.session_state:
+    st.session_state.dcf_ticker_data = None
+
+ticker_input = st.sidebar.text_input(
+    "Ticker",
+    value="AAPL",
+    help="Enter a symbol, then click Load. Each load calls Yahoo several times; wait if you see rate limits.",
+).strip().upper()
+load_clicked = st.sidebar.button("Load ticker data", use_container_width=True)
+
+ticker = ticker_input if ticker_input else "AAPL"
+
+# Fetch only on first visit (warm defaults) or when the user explicitly loads — not on every rerun/slider move.
+need_fetch = load_clicked or (st.session_state.dcf_loaded_ticker is None)
 
 ticker_data = None
-if ticker:
-    try:
-        ticker_data = load_ticker_data(ticker)
-    except Exception as e:
-        st.sidebar.warning(f"Could not load ticker data: {e}")
+if need_fetch and ticker:
+    with st.spinner("Loading market data from Yahoo…"):
+        try:
+            ticker_data = load_ticker_data(ticker)
+            st.session_state.dcf_ticker_data = ticker_data
+            st.session_state.dcf_loaded_ticker = ticker
+        except Exception as e:
+            if _is_rate_limit_error(e) and st.session_state.dcf_ticker_data is not None \
+                    and st.session_state.dcf_loaded_ticker == ticker:
+                ticker_data = st.session_state.dcf_ticker_data
+                st.sidebar.info(
+                    "Yahoo Finance rate-limited the request. Showing the last successful data from this session "
+                    "for this ticker. Wait several minutes, then click **Load ticker data** again."
+                )
+            else:
+                st.sidebar.warning(f"Could not load ticker data: {e}")
+                if _is_rate_limit_error(e):
+                    st.sidebar.caption(
+                        "Yahoo limits how often unofficial clients can pull data. "
+                        "Use **Load ticker data** only when needed, wait a few minutes, or enter assumptions manually below."
+                    )
+elif ticker == st.session_state.dcf_loaded_ticker:
+    ticker_data = st.session_state.dcf_ticker_data
+else:
+    st.sidebar.caption(
+        "Enter a symbol and click **Load ticker data** to pull figures from Yahoo. "
+        "Until then, the model uses the placeholder defaults below."
+    )
 
 if ticker_data:
     default_revenue = safe_float(ticker_data.get("revenue"), 1000.0)
