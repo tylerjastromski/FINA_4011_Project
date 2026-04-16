@@ -203,16 +203,18 @@ if ticker_data:
     default_growth = safe_float(ticker_data.get("revenue_growth_hint"), 0.05)
     rev = ticker_data.get("revenue")
     eb = ticker_data.get("ebit")
+    default_margin = 0.20
     try:
-        rev_ok = rev is not None and not pd.isna(rev) and float(rev) != 0.0
-        eb_ok = eb is not None and not pd.isna(eb)
+        if rev is None or eb is None or pd.isna(rev) or pd.isna(eb):
+            pass
+        else:
+            rev_f = float(rev)
+            eb_f = float(eb)
+            if rev_f != 0.0:
+                m = eb_f / rev_f
+                if np.isfinite(m) and m > 0:
+                    default_margin = m
     except (TypeError, ValueError):
-        rev_ok = eb_ok = False
-    if rev_ok and eb_ok:
-        default_margin = float(eb) / float(rev)
-        if not np.isfinite(default_margin) or default_margin <= 0:
-            default_margin = 0.20
-    else:
         default_margin = 0.20
     default_tax = safe_float(ticker_data.get("tax_rate"), 0.25)
     default_debt = safe_float(ticker_data.get("debt"), 500.0)
