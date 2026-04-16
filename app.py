@@ -19,15 +19,21 @@ def pct(x, decimals=2):
         return "N/A"
     return f"{x * 100:.{decimals}f}%"
 
+def _scalar_missing_or_nan(x):
+    """True if x is None, missing/NaN scalar, or non-scalar (list/ndarray), so it is not a single usable number."""
+    if x is None:
+        return True
+    if not pd.api.types.is_scalar(x):
+        return True
+    try:
+        return bool(pd.isna(x))
+    except (TypeError, ValueError):
+        return True
+
 def safe_float(x, default):
     """Parse yfinance / form values that may be missing, NaN, or oddly typed."""
-    if x is None:
+    if _scalar_missing_or_nan(x):
         return default
-    try:
-        if pd.isna(x):
-            return default
-    except TypeError:
-        pass
     try:
         return float(x)
     except (TypeError, ValueError):
@@ -205,7 +211,7 @@ if ticker_data:
     eb = ticker_data.get("ebit")
     default_margin = 0.20
     try:
-        if rev is None or eb is None or pd.isna(rev) or pd.isna(eb):
+        if _scalar_missing_or_nan(rev) or _scalar_missing_or_nan(eb):
             pass
         else:
             rev_f = float(rev)
