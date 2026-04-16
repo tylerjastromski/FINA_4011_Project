@@ -1,4 +1,3 @@
-
 import math
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -6,7 +5,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf
+
 
 
 st.set_page_config(
