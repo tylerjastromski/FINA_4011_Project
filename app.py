@@ -25,6 +25,14 @@ def pct(x, decimals=2):
         return "N/A"
     return f"{x * 100:.{decimals}f}%"
 
+
+def bounded(v, low, high):
+    return max(low, min(high, v))
+
+
+def range_text(low, mid, high):
+    return f"{pct(low, 1)} to {pct(high, 1)} (base case around {pct(mid, 1)})"
+
 def _scalar_missing_or_nan(x):
     """True if x is None, missing/NaN scalar, or non-scalar (list/ndarray), so it is not a single usable number."""
     if x is None:
@@ -103,6 +111,45 @@ def load_ticker_data(ticker):
         if not pd.isna(implied_tax):
             tax_rate = min(max(implied_tax, 0.0), 0.40)
 
+    hist_revenue_cagr = None
+    hist_revenue_avg_growth = None
+    hist_ebit_margin = None
+    if financials is not None and not financials.empty:
+        rev_row = None
+        for label in ["Total Revenue", "Revenue", "Operating Revenue"]:
+            exact = [idx for idx in financials.index if str(idx).strip().lower() == label.lower()]
+            if exact:
+                rev_row = financials.loc[exact[0]]
+                break
+        if rev_row is not None:
+            rev_series = pd.to_numeric(rev_row, errors="coerce").dropna()
+            if len(rev_series) >= 2:
+                rev_series = rev_series.sort_index()
+                first_rev = float(rev_series.iloc[0])
+                last_rev = float(rev_series.iloc[-1])
+                periods = len(rev_series) - 1
+                if first_rev > 0 and periods > 0:
+                    hist_revenue_cagr = (last_rev / first_rev) ** (1 / periods) - 1
+                growths = rev_series.pct_change().dropna()
+                if not growths.empty:
+                    hist_revenue_avg_growth = float(growths.mean())
+
+        ebit_row = None
+        for label in ["EBIT", "Operating Income"]:
+            exact = [idx for idx in financials.index if str(idx).strip().lower() == label.lower()]
+            if exact:
+                ebit_row = financials.loc[exact[0]]
+                break
+        if rev_row is not None and ebit_row is not None:
+            rev_series = pd.to_numeric(rev_row, errors="coerce")
+            ebit_series = pd.to_numeric(ebit_row, errors="coerce")
+            merged = pd.concat([rev_series, ebit_series], axis=1).dropna()
+            if not merged.empty:
+                margins = merged.iloc[:, 1] / merged.iloc[:, 0].replace(0, np.nan)
+                margins = margins.replace([np.inf, -np.inf], np.nan).dropna()
+                if not margins.empty:
+                    hist_ebit_margin = float(margins.median())
+
     return {
         "name": info.get("longName", ticker.upper()),
         "ticker": ticker.upper(),
@@ -121,6 +168,9 @@ def load_ticker_data(ticker):
         "wc_change": wc_change,
         "tax_rate": tax_rate,
         "revenue_growth_hint": info.get("revenueGrowth"),
+        "hist_revenue_cagr": hist_revenue_cagr,
+        "hist_revenue_avg_growth": hist_revenue_avg_growth,
+        "hist_ebit_margin": hist_ebit_margin,
     }
 
 def build_projection(revenue, growth_rates, margin, tax_rate, reinvest_rate):
@@ -212,7 +262,7 @@ def build_dcf_excel_bytes(
         upside_vs_market = value_per_share / market_price - 1
 
     summary_rows = [
-        ("Document type", "DCF valuation workbook"),
+        ("Document type", "DCF valuation workbook (formula-based)"),
         ("Generated", generated),
         ("Company", company),
         ("Ticker", ticker or ""),
@@ -220,43 +270,43 @@ def build_dcf_excel_bytes(
         ("Industry", industry),
         (None, None),
         ("Key results", None),
-        ("Enterprise value ($)", enterprise_value),
-        ("Equity value ($)", equity_value),
-        ("Intrinsic value per share ($)", value_per_share),
+        ("Enterprise value ($)", None),
+        ("Equity value ($)", None),
+        ("Intrinsic value per share ($)", None),
         ("Market price ($)", market_price if market_price is not None else np.nan),
-        ("Upside vs market (ratio vs price)", upside_vs_market),
+        ("Upside vs market (ratio vs price)", None),
         (None, None),
         ("Valuation bridge ($)", None),
-        ("PV of forecast period FCF", discounted_df["PV of FCF"].sum()),
-        ("PV of terminal value", pv_terminal),
-        ("Enterprise value", enterprise_value),
-        ("Less: debt", -debt),
-        ("Plus: cash", cash),
-        ("Equity value", equity_value),
-        ("Shares outstanding (count)", shares),
-        ("Intrinsic value per share", value_per_share),
-        ("Terminal value (undiscounted, exit year)", terminal_value),
+        ("PV of forecast period FCF", None),
+        ("PV of terminal value", None),
+        ("Enterprise value", None),
+        ("Less: debt", None),
+        ("Plus: cash", None),
+        ("Equity value", None),
+        ("Shares outstanding (count)", None),
+        ("Intrinsic value per share", None),
+        ("Terminal value (undiscounted, exit year)", None),
     ]
     summary_df = pd.DataFrame(summary_rows, columns=["Description", "Value"])
 
     assumption_records = [
         ("Ticker", ticker, "Company symbol"),
         ("Projection years", years, "Explicit forecast horizon"),
+        ("Current revenue ($)", revenue, "Starting revenue base"),
     ]
     for i in range(len(growth_rates)):
         assumption_records.append(
             (f"Year {i + 1} revenue growth", growth_rates[i], "Annual revenue growth assumption"),
         )
     assumption_records.extend([
-        ("Current revenue ($)", revenue, "Starting revenue base"),
         ("EBIT margin", margin, "Operating margin on revenue"),
         ("Tax rate", tax_rate, "Corporate tax on EBIT"),
         ("Reinvestment rate", reinvest, "NOPAT reinvested"),
         ("WACC", wacc, "Discount rate"),
         ("Terminal growth rate", terminal_growth, "Perpetuity growth"),
-        ("Debt ($)", debt, "Net debt subtracted at enterprise level"),
-        ("Cash ($)", cash, "Cash added at equity bridge"),
-        ("Shares outstanding", shares, "For value per share"),
+        ("Debt ($)", debt, "Auto-loaded from ticker data (editable in Excel)"),
+        ("Cash ($)", cash, "Auto-loaded from ticker data (editable in Excel)"),
+        ("Shares outstanding", shares, "Auto-loaded from ticker data (editable in Excel)"),
     ])
     assumptions_df = pd.DataFrame(assumption_records, columns=["Assumption", "Value", "Notes"])
 
@@ -273,7 +323,6 @@ def build_dcf_excel_bytes(
         "PV of FCF",
     ]
     forecast_df = discounted_df[[c for c in forecast_cols if c in discounted_df.columns]].copy()
-
     walkthrough_df = discounted_df[["Year", "FCF", "Discount Factor", "PV of FCF"]].copy()
 
     sens_export = sensitivity_df.copy()
@@ -284,6 +333,67 @@ def build_dcf_excel_bytes(
         forecast_df.to_excel(writer, sheet_name="Forecast_DCF", index=False)
         walkthrough_df.to_excel(writer, sheet_name="DCF_walkthrough", index=False)
         sens_export.to_excel(writer, sheet_name="Sensitivity", index=True)
+
+        ws_assump = writer.book["Assumptions"]
+        ws_fore = writer.book["Forecast_DCF"]
+        ws_sum = writer.book["Summary"]
+
+        row_map = {}
+        for r in range(2, ws_assump.max_row + 1):
+            key = ws_assump[f"A{r}"].value
+            if key is not None:
+                row_map[str(key)] = r
+
+        years_row = row_map["Projection years"]
+        rev_row = row_map["Current revenue ($)"]
+        margin_row = row_map["EBIT margin"]
+        tax_row = row_map["Tax rate"]
+        reinvest_row = row_map["Reinvestment rate"]
+        wacc_row = row_map["WACC"]
+        tg_row = row_map["Terminal growth rate"]
+        debt_row = row_map["Debt ($)"]
+        cash_row = row_map["Cash ($)"]
+        shares_row = row_map["Shares outstanding"]
+
+        first_data_row = 2
+        last_data_row = first_data_row + years - 1
+        for r in range(first_data_row, last_data_row + 1):
+            year_idx = r - 1
+            ws_fore[f"A{r}"] = year_idx
+            ws_fore[f"C{r}"] = f"=INDEX(Assumptions!$B:$B,{row_map['Year 1 revenue growth']}+A{r}-1)"
+            if r == first_data_row:
+                ws_fore[f"B{r}"] = f"=Assumptions!$B${rev_row}*(1+C{r})"
+            else:
+                ws_fore[f"B{r}"] = f"=B{r-1}*(1+C{r})"
+            ws_fore[f"D{r}"] = f"=B{r}*Assumptions!$B${margin_row}"
+            ws_fore[f"E{r}"] = f"=Assumptions!$B${margin_row}"
+            ws_fore[f"F{r}"] = f"=D{r}*(1-Assumptions!$B${tax_row})"
+            ws_fore[f"G{r}"] = f"=F{r}*Assumptions!$B${reinvest_row}"
+            ws_fore[f"H{r}"] = f"=F{r}-G{r}"
+            ws_fore[f"I{r}"] = f"=1/(1+Assumptions!$B${wacc_row})^A{r}"
+            ws_fore[f"J{r}"] = f"=H{r}*I{r}"
+
+        ws_sum["B10"] = "=B19"
+        ws_sum["B11"] = "=B22"
+        ws_sum["B12"] = "=B24"
+        ws_sum["B14"] = "=IF(B13=0,NA(),B12/B13-1)"
+        ws_sum["B17"] = f"=SUM(Forecast_DCF!J{first_data_row}:J{last_data_row})"
+        ws_sum["B25"] = f"=Forecast_DCF!H{last_data_row}*(1+Assumptions!$B${tg_row})/(Assumptions!$B${wacc_row}-Assumptions!$B${tg_row})"
+        ws_sum["B18"] = f"=B25/(1+Assumptions!$B${wacc_row})^Forecast_DCF!A{last_data_row}"
+        ws_sum["B19"] = "=B17+B18"
+        ws_sum["B20"] = f"=-Assumptions!$B${debt_row}"
+        ws_sum["B21"] = f"=Assumptions!$B${cash_row}"
+        ws_sum["B22"] = "=B19+B20+B21"
+        ws_sum["B23"] = f"=Assumptions!$B${shares_row}"
+        ws_sum["B24"] = "=B22/B23"
+
+        ws_walk = writer.book["DCF_walkthrough"]
+        for r in range(first_data_row, last_data_row + 1):
+            ws_walk[f"A{r}"] = f"=Forecast_DCF!A{r}"
+            ws_walk[f"B{r}"] = f"=Forecast_DCF!H{r}"
+            ws_walk[f"C{r}"] = f"=Forecast_DCF!I{r}"
+            ws_walk[f"D{r}"] = f"=Forecast_DCF!J{r}"
+
         _autosize_excel_columns(writer)
     buffer.seek(0)
     return buffer.getvalue()
@@ -403,6 +513,10 @@ if ticker_data:
     default_debt = safe_float(ticker_data.get("debt"), 500.0)
     default_cash = safe_float(ticker_data.get("cash"), 100.0)
     default_shares = safe_float(ticker_data.get("shares"), 100.0)
+    hist_growth_cagr = safe_float(ticker_data.get("hist_revenue_cagr"), default_growth)
+    hist_growth_avg = safe_float(ticker_data.get("hist_revenue_avg_growth"), default_growth)
+    hist_margin = safe_float(ticker_data.get("hist_ebit_margin"), default_margin)
+    beta_hint = safe_float(ticker_data.get("beta"), 1.0)
 else:
     default_revenue = 1000.0
     default_growth = 0.05
@@ -411,11 +525,32 @@ else:
     default_debt = 500.0
     default_cash = 100.0
     default_shares = 100.0
+    hist_growth_cagr = default_growth
+    hist_growth_avg = default_growth
+    hist_margin = default_margin
+    beta_hint = 1.0
 
 revenue = st.sidebar.number_input("Current Revenue ($)", min_value=0.0, value=default_revenue)
 years = st.sidebar.slider("Projection Years", 3, 10, 5)
 
 st.sidebar.subheader("Growth Assumptions")
+growth_base = bounded((hist_growth_cagr + hist_growth_avg) / 2, -0.10, 0.30)
+growth_low = bounded(growth_base - 0.03, -0.20, 0.25)
+growth_high = bounded(growth_base + 0.03, -0.05, 0.40)
+
+st.sidebar.caption(
+    f"Historical guide: revenue CAGR ~ {pct(hist_growth_cagr)} | avg YoY growth ~ {pct(hist_growth_avg)}."
+)
+with st.sidebar.expander("How to set growth (beginner guide)", expanded=False):
+    st.markdown(
+        f"""
+        - **What this means:** Revenue growth controls how fast sales expand each year.
+        - **Historical anchor:** This company has grown around **{pct(hist_growth_cagr)} CAGR** and **{pct(hist_growth_avg)} average YoY**.
+        - **Practical range:** Try **{range_text(growth_low, growth_base, growth_high)}** for the early forecast years.
+        - **Simple rule:** Start closer to history, then fade growth down each year as the business matures.
+        - **Red flag:** If near-term growth is much higher than history, keep a higher reinvestment rate to stay realistic.
+        """
+    )
 growth_rates = []
 for i in range(years):
     default_i = max(default_growth - 0.01 * i, -0.50)
@@ -425,15 +560,53 @@ for i in range(years):
 margin = st.sidebar.number_input("EBIT Margin (%)", value=float(default_margin * 100), step=0.5) / 100
 tax_rate = st.sidebar.number_input("Tax Rate (%)", value=float(default_tax * 100), step=0.5) / 100
 reinvest = st.sidebar.number_input("Reinvestment Rate (%)", value=50.0, step=0.5) / 100
+margin_low = bounded(hist_margin - 0.03, 0.01, 0.60)
+margin_high = bounded(hist_margin + 0.03, 0.03, 0.75)
+st.sidebar.caption(
+    f"Historical guide: median EBIT margin ~ {pct(hist_margin)}. "
+    "Keep reinvestment higher when growth assumptions are aggressive."
+)
+with st.sidebar.expander("How to set margin, tax, and reinvestment", expanded=False):
+    st.markdown(
+        f"""
+        - **EBIT margin:** % of revenue left after operating costs (before interest/taxes).  
+          Historical median here is about **{pct(hist_margin)}**; a reasonable range is **{pct(margin_low,1)} to {pct(margin_high,1)}**.
+        - **Tax rate:** Usually stable over time. If unsure, start near **{pct(default_tax)}** and adjust only with a clear reason.
+        - **Reinvestment rate:** % of NOPAT put back into the business.  
+          Higher growth usually needs higher reinvestment; lower growth can support lower reinvestment.
+        - **Quick check:** If you raise growth and margin together, make sure reinvestment is not unrealistically low.
+        """
+    )
 
 st.sidebar.subheader("Valuation Assumptions")
+rf_default = 0.045
+erp_default = 0.050
+wacc_hint = min(max(rf_default + beta_hint * erp_default, 0.06), 0.16)
+st.sidebar.caption(
+    f"Valuation guide: beta-implied WACC is roughly {pct(wacc_hint)} "
+    f"(using {pct(rf_default)} risk-free + {pct(erp_default)} equity risk premium). "
+    "Terminal growth is usually conservative (about 2%-3%)."
+)
 wacc = st.sidebar.number_input("WACC (%)", value=10.0, step=0.25) / 100
 terminal_growth = st.sidebar.number_input("Terminal Growth (%)", value=2.5, step=0.25) / 100
+with st.sidebar.expander("How to set WACC and terminal growth", expanded=False):
+    st.markdown(
+        f"""
+        - **WACC:** Your required annual return for this company.  
+          Beta-implied starting point is about **{pct(wacc_hint)}**.
+        - **Terminal growth:** Long-run growth after the forecast period.  
+          A common conservative range is **2.0% to 3.0%** for mature businesses.
+        - **Important rule:** WACC must be greater than terminal growth, or terminal value breaks mathematically.
+        - **Sensitivity tip:** If valuation moves a lot when WACC changes by +/-1%, treat output as a range, not a single target.
+        """
+    )
 
-st.sidebar.subheader("Capital Structure")
-debt = st.sidebar.number_input("Debt ($)", min_value=0.0, value=default_debt)
-cash = st.sidebar.number_input("Cash ($)", min_value=0.0, value=default_cash)
-shares = st.sidebar.number_input("Shares Outstanding", min_value=0.000001, value=default_shares)
+debt = default_debt
+cash = default_cash
+shares = max(default_shares, 0.000001)
+st.sidebar.caption(
+    f"Equity bridge inputs are auto-loaded: debt {money(debt)}, cash {money(cash)}, shares {shares:,.0f}."
+)
 
 if wacc <= terminal_growth:
     st.error("WACC must be greater than terminal growth for the terminal value formula to work.")
@@ -510,6 +683,51 @@ with tab1:
 
 with tab2:
     st.header("Assumptions")
+    st.markdown(
+        "Use this section as a teaching view: start from historical anchors, choose a base case, "
+        "then test optimistic and conservative cases in the sensitivity tab."
+    )
+
+    guide = pd.DataFrame({
+        "Assumption": [
+            "Revenue Growth (Years 1-2)",
+            "Revenue Growth (Terminal years)",
+            "EBIT Margin",
+            "Tax Rate",
+            "Reinvestment Rate",
+            "WACC",
+            "Terminal Growth",
+        ],
+        "Historical / market anchor": [
+            f"CAGR {pct(hist_growth_cagr)}; Avg YoY {pct(hist_growth_avg)}",
+            "Should trend down from early years",
+            f"Median historical EBIT margin {pct(hist_margin)}",
+            f"Current implied tax estimate {pct(default_tax)}",
+            "Linked to growth intensity",
+            f"Beta-implied starting point {pct(wacc_hint)}",
+            "Usually tied to long-run GDP/inflation-like growth",
+        ],
+        "Beginner-friendly starting point": [
+            range_text(growth_low, growth_base, growth_high),
+            f"{pct(bounded(growth_base - 0.03, -0.05, 0.12),1)} to {pct(bounded(growth_base - 0.01, 0.00, 0.15),1)}",
+            f"{pct(margin_low,1)} to {pct(margin_high,1)}",
+            f"{pct(bounded(default_tax - 0.03, 0.10, 0.35),1)} to {pct(bounded(default_tax + 0.03, 0.15, 0.40),1)}",
+            "30% to 70% (higher when growth is high)",
+            f"{pct(bounded(wacc_hint - 0.01, 0.05, 0.18),1)} to {pct(bounded(wacc_hint + 0.01, 0.06, 0.20),1)}",
+            "2.0% to 3.0% for mature companies",
+        ],
+        "What happens if too high": [
+            "Can overstate forecast sales and valuation",
+            "Can make terminal value unrealistic",
+            "Can overstate profitability and FCF",
+            "Can understate taxes and inflate value",
+            "Can overstate free cash flow",
+            "Can discount cash flows too heavily",
+            "Can create unstable/overstated terminal value",
+        ],
+    })
+    st.subheader("Assumption Playbook")
+    st.dataframe(guide, use_container_width=True, hide_index=True)
 
     assumptions = pd.DataFrame({
         "Input": [
