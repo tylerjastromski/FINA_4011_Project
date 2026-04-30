@@ -2,7 +2,13 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from datetime import datetime
 from io import BytesIO
+
+try:
+    from openpyxl.utils import get_column_letter
+except ImportError:
+    get_column_letter = None
 
 st.set_page_config(page_title="DCF Valuation App", page_icon="📊", layout="wide")
 
@@ -155,6 +161,133 @@ def discount_valuation(df, wacc, terminal_growth, debt, cash, shares):
     value_per_share = equity_value / shares if shares not in [0, None] else np.nan
 
     return out, terminal_value, pv_terminal, enterprise_value, equity_value, value_per_share
+
+def _autosize_excel_columns(writer):
+    """Widen columns slightly beyond header/data length so sheets are easier to scan."""
+    if get_column_letter is None:
+        return
+    for ws in writer.book.worksheets:
+        ws.freeze_panes = "A2"
+        for idx, col in enumerate(ws.iter_cols(min_row=1, max_row=min(ws.max_row, 200), values_only=False), start=1):
+            maxlen = 0
+            for cell in col:
+                if cell.value is None:
+                    continue
+                maxlen = max(maxlen, len(str(cell.value)))
+            letter = get_column_letter(idx)
+            ws.column_dimensions[letter].width = min(max(maxlen + 2, 10), 48)
+
+
+def build_dcf_excel_bytes(
+    ticker,
+    ticker_data,
+    revenue,
+    years,
+    growth_rates,
+    margin,
+    tax_rate,
+    reinvest,
+    wacc,
+    terminal_growth,
+    debt,
+    cash,
+    shares,
+    discounted_df,
+    enterprise_value,
+    equity_value,
+    value_per_share,
+    market_price,
+    terminal_value,
+    pv_terminal,
+    sensitivity_df,
+):
+    """Multi-sheet workbook: overview, assumptions, forecast, walkthrough, sensitivity."""
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M")
+    company = ticker_data["name"] if ticker_data else ""
+    sector = ticker_data["sector"] if ticker_data else ""
+    industry = ticker_data["industry"] if ticker_data else ""
+
+    upside_vs_market = np.nan
+    if market_price not in [None, 0] and not pd.isna(value_per_share):
+        upside_vs_market = value_per_share / market_price - 1
+
+    summary_rows = [
+        ("Document type", "DCF valuation workbook"),
+        ("Generated", generated),
+        ("Company", company),
+        ("Ticker", ticker or ""),
+        ("Sector", sector),
+        ("Industry", industry),
+        (None, None),
+        ("Key results", None),
+        ("Enterprise value ($)", enterprise_value),
+        ("Equity value ($)", equity_value),
+        ("Intrinsic value per share ($)", value_per_share),
+        ("Market price ($)", market_price if market_price is not None else np.nan),
+        ("Upside vs market (ratio vs price)", upside_vs_market),
+        (None, None),
+        ("Valuation bridge ($)", None),
+        ("PV of forecast period FCF", discounted_df["PV of FCF"].sum()),
+        ("PV of terminal value", pv_terminal),
+        ("Enterprise value", enterprise_value),
+        ("Less: debt", -debt),
+        ("Plus: cash", cash),
+        ("Equity value", equity_value),
+        ("Shares outstanding (count)", shares),
+        ("Intrinsic value per share", value_per_share),
+        ("Terminal value (undiscounted, exit year)", terminal_value),
+    ]
+    summary_df = pd.DataFrame(summary_rows, columns=["Description", "Value"])
+
+    assumption_records = [
+        ("Ticker", ticker, "Company symbol"),
+        ("Projection years", years, "Explicit forecast horizon"),
+    ]
+    for i in range(len(growth_rates)):
+        assumption_records.append(
+            (f"Year {i + 1} revenue growth", growth_rates[i], "Annual revenue growth assumption"),
+        )
+    assumption_records.extend([
+        ("Current revenue ($)", revenue, "Starting revenue base"),
+        ("EBIT margin", margin, "Operating margin on revenue"),
+        ("Tax rate", tax_rate, "Corporate tax on EBIT"),
+        ("Reinvestment rate", reinvest, "NOPAT reinvested"),
+        ("WACC", wacc, "Discount rate"),
+        ("Terminal growth rate", terminal_growth, "Perpetuity growth"),
+        ("Debt ($)", debt, "Net debt subtracted at enterprise level"),
+        ("Cash ($)", cash, "Cash added at equity bridge"),
+        ("Shares outstanding", shares, "For value per share"),
+    ])
+    assumptions_df = pd.DataFrame(assumption_records, columns=["Assumption", "Value", "Notes"])
+
+    forecast_cols = [
+        "Year",
+        "Revenue",
+        "Growth Rate",
+        "EBIT",
+        "EBIT Margin",
+        "NOPAT",
+        "Reinvestment",
+        "FCF",
+        "Discount Factor",
+        "PV of FCF",
+    ]
+    forecast_df = discounted_df[[c for c in forecast_cols if c in discounted_df.columns]].copy()
+
+    walkthrough_df = discounted_df[["Year", "FCF", "Discount Factor", "PV of FCF"]].copy()
+
+    sens_export = sensitivity_df.copy()
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        assumptions_df.to_excel(writer, sheet_name="Assumptions", index=False)
+        forecast_df.to_excel(writer, sheet_name="Forecast_DCF", index=False)
+        walkthrough_df.to_excel(writer, sheet_name="DCF_walkthrough", index=False)
+        sens_export.to_excel(writer, sheet_name="Sensitivity", index=True)
+        _autosize_excel_columns(writer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
 
 def sensitivity_table(revenue, growth_rates, margin, tax_rate, reinvest_rate, debt, cash, shares, base_wacc, base_tg):
     waccs = [max(0.01, round(base_wacc + x, 4)) for x in [-0.02, -0.01, 0.00, 0.01, 0.02]]
@@ -330,6 +463,10 @@ market_price = ticker_data["price"] if ticker_data else None
 valuation_gap = None
 if market_price not in [None, 0] and not pd.isna(value_per_share):
     valuation_gap = value_per_share / market_price - 1
+
+sensitivity_df = sensitivity_table(
+    revenue, growth_rates, margin, tax_rate, reinvest, debt, cash, shares, wacc, terminal_growth
+)
 
 with tab1:
     st.header("Valuation Summary")
@@ -512,30 +649,56 @@ with tab4:
 
 with tab5:
     st.header("Sensitivity Analysis")
-    sens = sensitivity_table(revenue, growth_rates, margin, tax_rate, reinvest, debt, cash, shares, wacc, terminal_growth)
     st.caption("Rows are terminal growth assumptions and columns are WACC assumptions.")
-    sens_display = sens.copy()
+    sens_display = sensitivity_df.copy()
     for col in sens_display.columns:
         sens_display[col] = sens_display[col].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "N/A")
     st.dataframe(sens_display, use_container_width=True)
 
     st.write("DCF outputs are highly sensitive to discount rate and terminal growth assumptions. Use the table as a valuation range, not a single perfect number.")
 
+st.divider()
+st.markdown("##### Export to Excel")
+st.caption(
+    "Downloads a workbook with Summary, Assumptions, Forecast_DCF, DCF_walkthrough, and Sensitivity tabs "
+    "(numeric values—format currency or % in Excel as you prefer)."
+)
+
+safe_name = (ticker or "model").lower().replace(" ", "_")
 try:
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        discounted_df.to_excel(writer, sheet_name="Projection", index=False)
-        pd.DataFrame({
-            "Metric": ["Enterprise Value", "Equity Value", "Intrinsic Value Per Share", "Current Market Price"],
-            "Value": [enterprise_value, equity_value, value_per_share, market_price]
-        }).to_excel(writer, sheet_name="Summary", index=False)
-    buffer.seek(0)
-    safe_name = (ticker or "model").lower().replace(" ", "_")
-    st.download_button(
-        "Download valuation output to Excel",
-        data=buffer.getvalue(),
-        file_name=f"{safe_name}_dcf_model.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    excel_bytes = build_dcf_excel_bytes(
+        ticker,
+        ticker_data,
+        revenue,
+        years,
+        growth_rates,
+        margin,
+        tax_rate,
+        reinvest,
+        wacc,
+        terminal_growth,
+        debt,
+        cash,
+        shares,
+        discounted_df,
+        enterprise_value,
+        equity_value,
+        value_per_share,
+        market_price,
+        terminal_value,
+        pv_terminal,
+        sensitivity_df,
     )
+    left, mid, right = st.columns([1, 2, 1])
+    with mid:
+        st.download_button(
+            label="Download Excel workbook",
+            data=excel_bytes,
+            file_name=f"{safe_name}_dcf_model.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+            help="Structured sheets with valuation summary, inputs, forecast, discounting detail, and sensitivity grid.",
+        )
 except ImportError:
     st.caption("Excel download requires **openpyxl**. Install with `pip install openpyxl` and restart the app.")
